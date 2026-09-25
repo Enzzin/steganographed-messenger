@@ -1,6 +1,10 @@
+import argparse
 import socket
 import struct
 import sys
+import threading
+import time
+from datetime import datetime
 
 FORMAT = "!BBHHH"
 
@@ -24,7 +28,7 @@ PART_LOW = 1   # Low nibble
 SUB_SIZE = 0       # File size
 SUB_EXTENSION = 1  # File extension
 
-# Update when containers are created
+# Default network address (overridden via CLI arguments, defaults to localhost)
 SOURCE = "127.0.0.1"
 
 # Map to retrieve the extension from the code
@@ -58,31 +62,121 @@ def validate_parity(nibble: int, parity_bit: int) -> bool:
     else:
         return 1
 
-print(f"Listening on {SOURCE} and waiting for packets")
+# ── History ───────────────────────────────────────────────────
+# Each entry is a dict with: timestamp, type ("msg" or file ext), content (str for msg, path for file), size, integrity
+reception_history = []
+history_lock = threading.Lock()
 
-# Setting initial flags
-receiving = False
-file_buffer = bytearray()
-temp_high_nibble = None
-expected_size = 0
-file_extension = "bin"
-expected_seq = 0
+def show_history():
+    """Displays the full reception history."""
+    with history_lock:
+        if not reception_history:
+            print("\n  No messages or files received yet.")
+            print()
+            return
 
-# Storing the 6 nibbles of the file size
-size_nibbles = []
-receiving_size = False
+        print("\n" + "=" * 60)
+        print("  Reception History")
+        print("=" * 60)
 
-# Packet counter for control
-data_packets = 0
-ignored_packets = 0
+        for i, entry in enumerate(reception_history, 1):
+            timestamp = entry["timestamp"]
+            entry_type = entry["type"]
+            integrity = entry["integrity"]
 
-# Actual start of communication
-with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
-    s.bind((SOURCE, 0))
+            if entry_type == "msg":
+                print(f"  #{i}  [{timestamp}]  MESSAGE")
+                print(f"       \"{entry['content']}\"")
+            else:
+                print(f"  #{i}  [{timestamp}]  FILE (.{entry_type})")
+                print(f"       Saved as: {entry['content']}")
+
+            print(f"       Size: {entry['size']} bytes | Integrity: {integrity}")
+            print("-" * 60)
+
+        print(f"  Total: {len(reception_history)} reception(s)")
+        print("=" * 60)
+        print()
+
+def resolve_ip(host: str) -> str:
+    """Resolves 'localhost' or a hostname to an IPv4 address, defaulting to 127.0.0.1."""
+    if not host or host.lower() == "localhost":
+        return "127.0.0.1"
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror:
+        return host
+
+def parse_arguments() -> tuple[str, str | None]:
+    """Parses source/bind IP and optional output path from CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="Steganographed Messenger - Receive data hidden in ICMP packets."
+    )
+    parser.add_argument(
+        "-s", "--source", "--bind",
+        dest="source",
+        default=None,
+        help="Source/bind IP address to listen on (default: 127.0.0.1 / localhost)",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        dest="output_file",
+        default=None,
+        help="Custom output file path to save received files",
+    )
+    parser.add_argument(
+        "pos_arg",
+        nargs="?",
+        default=None,
+        help="Source/bind IP address or output file path (optional)",
+    )
+
+    args = parser.parse_args()
+
+    src = args.source
+    out = args.output_file
+
+    if args.pos_arg:
+        pos = args.pos_arg
+        known_exts = (".bin", ".jpg", ".jpeg", ".png", ".pdf", ".zip", ".txt", ".bmp", ".gif", ".mp3", ".wav", ".mp4", ".doc", ".py", ".tar")
+        if pos.lower().endswith(known_exts):
+            if not out:
+                out = pos
+        else:
+            if not src:
+                src = pos
+
+    src = resolve_ip(src or "127.0.0.1")
+    return src, out
+
+# ── Listener Thread ───────────────────────────────────────────
+
+def listener_thread(sock, custom_save_path=None):
+    """Background thread that listens for incoming steganographed packets."""
+
+    # Setting initial flags
+    receiving = False
+    file_buffer = bytearray()
+    temp_high_nibble = None
+    expected_size = 0
+    file_extension = "bin"
+    expected_seq = 0
+
+    # Storing the 6 nibbles of the file size
+    size_nibbles = []
+    receiving_size = False
+
+    # Packet counter for control
+    data_packets = 0
+    ignored_packets = 0
 
     while True:
-        # Receives data from the raw socket (packet with IP header + ICMP + payload)
-        data, address = s.recvfrom(1024)
+        try:
+            # Receives data from the raw socket (packet with IP header + ICMP + payload)
+            data, address = sock.recvfrom(1024)
+        except OSError:
+            # Socket was closed, exit the thread
+            break
 
         # Unpacks the ICMP header starting at byte 20 after the 20-byte IP header
         type_field, code, checksum, _id, seq = struct.unpack(FORMAT, data[20:28])
@@ -162,6 +256,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
                 print("\nEnd (END) packet received - Finalizing reception")
 
                 received_size = len(file_buffer)
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # Simple integrity check
+                if received_size == expected_size:
+                    integrity = "OK"
+                else:
+                    integrity = f"WARNING ({abs(expected_size - received_size)} bytes off)"
 
                 # Check if it's a text message or a file
                 if file_extension == "msg":
@@ -175,13 +276,30 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
                     print(f"Bytes expected:     {expected_size}")
                     print(f"Data packets:       {data_packets}")
                     print(f"Ignored packets:    {ignored_packets}")
+                    print(f"Integrity:          {integrity}")
+                    print("=" * 50)
+
+                    # Save to history
+                    with history_lock:
+                        reception_history.append({
+                            "timestamp": timestamp,
+                            "type": "msg",
+                            "content": decoded_message,
+                            "size": received_size,
+                            "integrity": integrity,
+                        })
                 else:
                     # File mode: save to disk
-                    # File path to save, passed directly via CLI if provided
-                    if len(sys.argv) > 1:
-                        save_path = sys.argv[1]
+                    if custom_save_path:
+                        save_path = custom_save_path
                     else:
-                        save_path = f"received.{file_extension}"
+                        # Add a number suffix to avoid overwriting previous files
+                        with history_lock:
+                            file_count = sum(1 for e in reception_history if e["type"] == file_extension)
+                        if file_count > 0:
+                            save_path = f"received_{file_count + 1}.{file_extension}"
+                        else:
+                            save_path = f"received.{file_extension}"
 
                     # wb saves in binary mode to avoid corrupting files like images or executables
                     with open(save_path, "wb") as f:
@@ -194,15 +312,32 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
                     print(f"Bytes expected:     {expected_size}")
                     print(f"Data packets:       {data_packets}")
                     print(f"Ignored packets:    {ignored_packets}")
+                    print(f"Integrity:          {integrity}")
+                    print("=" * 50)
 
-                # Simple integrity check
-                if received_size == expected_size:
-                    print("Integrity: OK (sizes match perfectly)")
-                else:
-                    print(f"Integrity: WARNING (difference of {abs(expected_size - received_size)} bytes)")
-                print("=" * 50)
+                    # Save to history
+                    with history_lock:
+                        reception_history.append({
+                            "timestamp": timestamp,
+                            "type": file_extension,
+                            "content": save_path,
+                            "size": received_size,
+                            "integrity": integrity,
+                        })
 
-                break
+                # Reset all state for the next transmission
+                receiving = False
+                file_buffer = bytearray()
+                temp_high_nibble = None
+                expected_size = 0
+                file_extension = "bin"
+                expected_seq = 0
+                size_nibbles = []
+                receiving_size = False
+                data_packets = 0
+                ignored_packets = 0
+
+                print(f"\nWaiting for next transmission... (type 'h' for history)")
 
         # If it's a DATA packet (Bit 7 == 0)
         elif ctx == CTX_DATA:
@@ -245,3 +380,47 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
                         if expected_size > 0:
                             percentage = (bytes_received / expected_size) * 100
                             print(f"{bytes_received}/{expected_size} bytes received: {percentage:.2f}% completed")
+
+
+# ── Main Program ──────────────────────────────────────────────
+
+SOURCE, custom_save_path = parse_arguments()
+
+print("=" * 60)
+print("  Steganographed Messenger - Receiver")
+print(f"  Listening IP (bind): {SOURCE}")
+if custom_save_path:
+    print(f"  Save file path:      {custom_save_path}")
+print("=" * 60)
+print("Commands:")
+print("  h / history  - View reception history")
+print("  q / quit     - Exit the receiver")
+print("=" * 60)
+print()
+
+# Open the socket and start the listener thread
+sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+sock.bind((SOURCE, 0))
+
+listener = threading.Thread(target=listener_thread, args=(sock, custom_save_path), daemon=True)
+listener.start()
+
+# Main thread: interactive command prompt
+try:
+    while True:
+        try:
+            cmd = input().strip().lower()
+        except EOFError:
+            break
+
+        if cmd in ("h", "history"):
+            show_history()
+        elif cmd in ("q", "quit", "exit"):
+            print("Shutting down receiver...")
+            break
+        elif cmd:
+            print("Unknown command. Type 'h' for history or 'q' to quit.")
+except KeyboardInterrupt:
+    print("\nReceiver interrupted.")
+finally:
+    sock.close()

@@ -1,3 +1,4 @@
+import argparse
 import socket
 import struct
 import os
@@ -26,7 +27,7 @@ PART_LOW = 1   # Low nibble
 SUB_SIZE = 0       # File size
 SUB_EXTENSION = 1  # File extension
 
-# Update when containers are created
+# Default network addresses (overridden via CLI arguments, defaults to localhost)
 SOURCE      = "127.0.0.1"
 DESTINATION = "127.0.0.1"
 
@@ -107,83 +108,131 @@ EXTENSION_MAP = {
     "msg": 0xF,  # Special code for text messages
 }
 
-# Interactive menu for choosing what to send
-print("=" * 50)
-print("  Steganographed Messenger - Sender")
-print("=" * 50)
-print("[1] Send a text message")
-print("[2] Send a file")
-print("=" * 50)
+def resolve_ip(host: str) -> str:
+    """Resolves 'localhost' or a hostname to an IPv4 address, defaulting to 127.0.0.1."""
+    if not host or host.lower() == "localhost":
+        return "127.0.0.1"
+    try:
+        return socket.gethostbyname(host)
+    except socket.gaierror:
+        return host
 
-choice = input("Select an option (1/2): ").strip()
+def parse_arguments() -> tuple[str, str]:
+    """Parses destination and source IP addresses from CLI arguments with default to localhost."""
+    parser = argparse.ArgumentParser(
+        description="Steganographed Messenger - Send data hidden in ICMP packets."
+    )
+    parser.add_argument(
+        "-d", "--destination", "--dest",
+        dest="destination",
+        default=None,
+        help="Destination IP address or hostname (default: 127.0.0.1 / localhost)",
+    )
+    parser.add_argument(
+        "-s", "--source", "--src",
+        dest="source",
+        default=None,
+        help="Source IP address to bind to (default: 127.0.0.1 / localhost)",
+    )
+    parser.add_argument(
+        "pos_destination",
+        nargs="?",
+        default=None,
+        help="Destination IP address (optional positional argument)",
+    )
+    parser.add_argument(
+        "pos_source",
+        nargs="?",
+        default=None,
+        help="Source IP address (optional positional argument)",
+    )
 
-if choice == "1":
-    # Text message mode: user types the message directly in the CLI
-    text_message = input("Type your message: ")
-    file_data = text_message.encode("utf-8")
-    file_size = len(file_data)
-    extension = "msg"
-    extension_code = EXTENSION_MAP["msg"]
+    args = parser.parse_args()
 
-    print(f"\nStarting message transmission")
-    print(f"Message: {text_message}")
-    print(f"Size: {file_size} bytes")
-    print(f"Destination: {DESTINATION}")
-    print(f"{file_size * 2} DATA packets")
+    dest = args.destination or args.pos_destination or "127.0.0.1"
+    src = args.source or args.pos_source or "127.0.0.1"
 
-elif choice == "2":
-    # File mode: user provides the file path via CLI argument or input
-    if len(sys.argv) > 1:
-        file_path = sys.argv[1]
+    return resolve_ip(dest), resolve_ip(src)
+
+def select_mode():
+    """Displays mode selection menu and returns the chosen mode."""
+    print("\n" + "=" * 50)
+    print("  Select transmission mode")
+    print("=" * 50)
+    print("[1] Send a text message")
+    print("[2] Send a file")
+    print("=" * 50)
+    while True:
+        choice = input("Select an option (1/2): ").strip()
+        if choice in ("1", "2"):
+            return choice
+        print("Invalid option. Please select 1 or 2.")
+
+def select_speed():
+    """Displays speed selection menu and returns the chosen delay value."""
+    print("\n" + "=" * 50)
+    print("  Select transmission speed")
+    print("=" * 50)
+    for key, (label, _) in DELAY_OPTIONS.items():
+        print(f"[{key}] {label}")
+    print("=" * 50)
+    speed_choice = input("Select speed (1-6) [default: 3]: ").strip()
+    if speed_choice not in DELAY_OPTIONS:
+        speed_choice = "3"  # Default: Normal (5ms)
+    label, delay = DELAY_OPTIONS[speed_choice]
+    print(f"Speed selected: {label}\n")
+    return delay
+
+def get_data_for_mode(mode):
+    """Gets the data to send based on the current mode. Returns (file_data, file_size, extension, extension_code)."""
+    if mode == "1":
+        # Text message mode: user types the message directly in the CLI
+        text_message = input("Type your message: ")
+        file_data = text_message.encode("utf-8")
+        file_size = len(file_data)
+        extension = "msg"
+        extension_code = EXTENSION_MAP["msg"]
+
+        print(f"\nStarting message transmission")
+        print(f"Message: {text_message}")
+        print(f"Size: {file_size} bytes")
+        print(f"Destination: {DESTINATION}")
+        print(f"{file_size * 2} DATA packets")
     else:
-        file_path = input("Enter the file path: ").strip()
+        # File mode: user provides the file path via CLI argument or input
+        if len(sys.argv) > 1:
+            file_path = sys.argv[1]
+            # Clear argv so it's not reused on the next iteration
+            sys.argv = sys.argv[:1]
+        else:
+            file_path = input("Enter the file path: ").strip()
 
-    if not os.path.isfile(file_path):
-        print(f"Error: File '{file_path}' not found.")
-        sys.exit(1)
+        if not os.path.isfile(file_path):
+            print(f"Error: File '{file_path}' not found.")
+            return None
 
-    # rb opens in raw binary mode without text encoding so that bytes are handled correctly
-    with open(file_path, "rb") as f:
-        file_data = f.read()
+        # rb opens in raw binary mode without text encoding so that bytes are handled correctly
+        with open(file_path, "rb") as f:
+            file_data = f.read()
 
-    file_size = len(file_data)
+        file_size = len(file_data)
 
-    # Getting the file extension and removing the dot
-    extension = os.path.splitext(file_path)[1].lstrip(".")
-    extension_code = EXTENSION_MAP.get(extension.lower(), 0x0)  # Default: binary
+        # Getting the file extension and removing the dot
+        extension = os.path.splitext(file_path)[1].lstrip(".")
+        extension_code = EXTENSION_MAP.get(extension.lower(), 0x0)  # Default: binary
 
-    print(f"\nStarting file transmission")
-    print(f"File: {file_path}")
-    print(f"Size: {file_size} bytes")
-    print(f"Extension: {extension} (code: 0x{extension_code:X})")
-    print(f"Destination: {DESTINATION}")
-    print(f"{file_size * 2} DATA packets")
+        print(f"\nStarting file transmission")
+        print(f"File: {file_path}")
+        print(f"Size: {file_size} bytes")
+        print(f"Extension: {extension} (code: 0x{extension_code:X})")
+        print(f"Destination: {DESTINATION}")
+        print(f"{file_size * 2} DATA packets")
 
-else:
-    print("Invalid option. Exiting.")
-    sys.exit(1)
+    return file_data, file_size, extension, extension_code
 
-# Speed selection menu
-print("\n" + "=" * 50)
-print("  Select transmission speed")
-print("=" * 50)
-for key, (label, _) in DELAY_OPTIONS.items():
-    print(f"[{key}] {label}")
-print("=" * 50)
-
-speed_choice = input("Select speed (1-6) [default: 3]: ").strip()
-if speed_choice not in DELAY_OPTIONS:
-    speed_choice = "3"  # Default: Normal (5ms)
-
-delay_label, DELAY_BETWEEN_PACKETS = DELAY_OPTIONS[speed_choice]
-print(f"Speed selected: {delay_label}\n")
-
-# Sent packet counter
-packet_count = 0
-
-# Actual start of communication
-with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
-    s.bind((SOURCE, 0))
+def transmit(sock, file_data, file_size, extension, extension_code, delay):
+    """Handles the full transmission of one message/file over the socket."""
+    packet_count = 0
 
     print("\nStarting the first phase of data transmission, sending START and metadata")
 
@@ -202,8 +251,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
         # Replaces bits 7 to 4 with those generated by the byte builder function and bits 3 to 0 with the size nibble
         ctrl_byte = (ctrl_byte & 0xF0) | (size_nibble & 0x0F)
         packet_count += 1
-        send_packet(s, ctrl_byte, packet_count)
-        time.sleep(DELAY_BETWEEN_PACKETS)
+        send_packet(sock, ctrl_byte, packet_count)
+        time.sleep(delay)
 
     print(f"Total size from 6 nibbles sent: {file_size}")
 
@@ -212,8 +261,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
     # Replaces bits 7 to 4 with those generated by the byte builder function and bits 3 to 0 with the file extension code
     ext_byte = (ext_byte & 0xF0) | (extension_code & 0x0F)
     packet_count += 1
-    send_packet(s, ext_byte, packet_count)
-    time.sleep(DELAY_BETWEEN_PACKETS)
+    send_packet(sock, ext_byte, packet_count)
+    time.sleep(delay)
 
     print(f"Extension {extension} sent as code 0x{extension_code:x}")
 
@@ -233,8 +282,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
         # Using the already created function to build the data packet
         byte_high = build_data_byte(seq_bit, PART_HIGH, high_nibble)
         packet_count += 1
-        send_packet(s, byte_high, packet_count)
-        time.sleep(DELAY_BETWEEN_PACKETS)
+        send_packet(sock, byte_high, packet_count)
+        time.sleep(delay)
 
         # Same as above but for the low nibbles
         # Clearing the beginning to keep only bits 3 to 0; no shift needed because they are already in the correct position
@@ -242,8 +291,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
         # Using the already created function to build the data packet
         byte_low = build_data_byte(seq_bit, PART_LOW, low_nibble)
         packet_count += 1
-        send_packet(s, byte_low, packet_count)
-        time.sleep(DELAY_BETWEEN_PACKETS)
+        send_packet(sock, byte_low, packet_count)
+        time.sleep(delay)
 
         # Using XOR to toggle from 1 to 0 and from 0 to 1
         seq_bit ^= 1
@@ -261,7 +310,59 @@ with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
 
     byte_end = build_control_byte(CMD_END, 0)
     packet_count += 1
-    send_packet(s, byte_end, packet_count)
+    send_packet(sock, byte_end, packet_count)
 
     print("End packet sent successfully")
     print("Transmission completed")
+
+# ── Main Program ──────────────────────────────────────────────
+
+DESTINATION, SOURCE = parse_arguments()
+
+print("=" * 50)
+print("  Steganographed Messenger - Sender")
+print(f"  Source IP (bind):    {SOURCE}")
+print(f"  Destination IP:      {DESTINATION}")
+print("=" * 50)
+
+# Initial setup: select mode and speed once
+current_mode = select_mode()
+current_delay = select_speed()
+
+# Keep the socket open for the entire session
+with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
+    s.bind((SOURCE, 0))
+
+    while True:
+        # Get data based on current mode (message or file)
+        result = get_data_for_mode(current_mode)
+
+        if result is None:
+            # File not found or error, let the user try again
+            print("Skipping this transmission.\n")
+        else:
+            file_data, file_size, extension, extension_code = result
+            transmit(s, file_data, file_size, extension, extension_code, current_delay)
+
+        # Post-transmission menu
+        print("\n" + "=" * 50)
+        mode_label = "Text message" if current_mode == "1" else "File"
+        print(f"  Current mode: {mode_label}")
+        print("=" * 50)
+        print("[1] Send again (same settings)")
+        print("[2] Change settings")
+        print("[3] Quit")
+        print("=" * 50)
+
+        action = input("Select an option (1/2/3): ").strip()
+
+        if action == "2":
+            current_mode = select_mode()
+            current_delay = select_speed()
+        elif action == "3":
+            print("Goodbye!")
+            break
+        # action == "1" or anything else → loop again with same settings
+
+        print()
+
