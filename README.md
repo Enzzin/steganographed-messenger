@@ -57,9 +57,3 @@ python envia_final.py
 ```
 
 ---
-
-<div align="center">
-
-Feito com ☕ e curiosidade por segurança ofensiva/defensiva 💻✨
-
-</div>
