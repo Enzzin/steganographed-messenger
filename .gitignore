@@ -55,3 +55,6 @@ ehthumbs.db
 temp/
 received_files/
 output/
+
+# Temporary Python/Tk runtime used for local GUI verification
+.tmp-gui-runtime/
